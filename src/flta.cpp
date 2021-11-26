@@ -1,6 +1,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IRBuilder.h"
 
 #include "flta.h"
 #include "utils.h"
@@ -17,6 +18,8 @@ static void
 printFuncs(raw_ostream &OutS, const std::vector<Function *> Funcs);
 static void
 printCompare(raw_ostream &OutS, const CallBase *ICall);
+static void
+printICalls(raw_ostream &OutS, const std::vector<CallBase*> ICalls);
 
 #define LOG(X)                            \
 	X->print(llvm::errs());               \
@@ -29,7 +32,14 @@ static std::vector<FunctionType *> ICallTypes;
 
 static std::vector<Function *> AddrTakenFuncs;
 static std::vector<FunctionType *> AddrTakenFuncTypes;
-static llvm::DenseMap<FunctionType *, std::vector<Function *>> Type2Funcs;
+
+// Initialized via createType2FuncMapping()
+static llvm::DenseMap<FunctionType *, std::vector<Function *>> Type2Funcs; /* The Type has a numeric suffix */
+
+// Initialized via makeFuncAddrArray()
+static std::vector<Constant *> FuncAddrs;
+// Initialized via makeICallAddrArray
+static std::vector<Constant *> ICallAddrs;
 
 static void
 createType2FuncMapping()
@@ -57,10 +67,6 @@ static std::vector<Function *>
 resolveICallTarget(CallBase *ICall)
 {
 	std::vector<Function *> Targets;
-	// if (Type2Funcs.find(ICall->getFunctionType()) != Type2Funcs.end())
-	// {
-	// 	Targets = Type2Funcs[ICall->getFunctionType()];
-	// }
 	Targets.clear();
 	for (auto &Elem : Type2Funcs)
 	{
@@ -74,8 +80,8 @@ resolveICallTarget(CallBase *ICall)
 	return Targets;
 }
 
-FLTA::Result
-FLTA::runOnModule(Module &M)
+static void
+analysis(Module &M)
 {
 	for (auto &Func : M)
 	{
@@ -102,6 +108,94 @@ FLTA::runOnModule(Module &M)
 	}
 }
 
+static void
+makeICallAddrArray(Module &M)
+{
+	/* Break BB into two pieces. */
+	/* ICall is always at the front of the BB*/
+	for (auto &&ICall : ICalls)
+	{
+		
+		ICallAddrs.push_back(
+			BlockAddress::get(
+				ICall->getParent()->splitBasicBlock(
+					ICall,
+					".icall"
+					)));
+	}
+
+	ArrayType *ICallAddrArrayTy = ArrayType::get(
+		IntegerType::getInt8PtrTy(
+			M.getContext()),
+		ICalls.size());
+
+	GlobalVariable *ICallAddrArray = new GlobalVariable(
+		M,
+		ICallAddrArrayTy,
+		true,
+		GlobalValue::ExternalLinkage,
+		0,
+		"icall_addr_array");
+    
+	ICallAddrArray->setInitializer(
+		ConstantArray::get(
+			ArrayType::get(
+				Type::getInt8PtrTy(M.getContext()),
+				ICalls.size()),
+			llvm::makeArrayRef(ICallAddrs)));
+	ICallAddrArray->setSection(".icall_addrs");
+}
+
+
+
+// Create FuncAddrArray -> [i8* * N]
+// an array contains the address of address-taken functions
+// N is determined in compile time
+static void
+makeFuncAddrArray(Module &M)
+{
+
+	for (auto &Func : AddrTakenFuncs)
+	{
+		/* llvm::Function is llvm::Constant */
+		/* bitcast Function* to int8* */
+		FuncAddrs.push_back(
+			ConstantExpr::getBitCast(
+				Func,
+				PointerType::getInt8PtrTy(
+					M.getContext())));
+	}
+
+	ArrayType *FuncAddrArrayTy = ArrayType::get(
+		IntegerType::getInt8PtrTy(
+			M.getContext()),
+		AddrTakenFuncs.size());
+	GlobalVariable *FuncAddrArray = new GlobalVariable(
+		M,
+		FuncAddrArrayTy,
+		true,
+		GlobalValue::ExternalLinkage,
+		0,
+		"func_addr_array");
+	FuncAddrArray->setInitializer(
+		ConstantArray::get(
+			ArrayType::get(
+				Type::getInt8PtrTy(M.getContext()),
+				AddrTakenFuncs.size()),
+			llvm::makeArrayRef(FuncAddrs)));
+	FuncAddrArray->setSection(".func_addrs");
+}
+
+
+
+FLTA::Result
+FLTA::runOnModule(Module &M)
+{
+	analysis(M);
+	makeICallAddrArray(M);
+	makeFuncAddrArray(M);
+}
+
 PreservedAnalyses
 FLTA::run(llvm::Module &M, llvm::ModuleAnalysisManager &)
 {
@@ -111,8 +205,9 @@ FLTA::run(llvm::Module &M, llvm::ModuleAnalysisManager &)
 	// printCompare(llvm::errs(), (CallBase *)0x555556835b60);
 	// printMapResult(llvm::errs(), Type2Funcs);
 	// printFLTAResult(llvm::errs(), AddrTakenFuncTypes);
-	printICallTargets(llvm::errs(), ICalls);
-	return PreservedAnalyses::all();
+	// printICallTargets(llvm::errs(), ICalls);
+	// printICalls(llvm::errs(), ICalls);
+	return PreservedAnalyses::none();
 }
 
 //-----------------------------------------------------------------------------
@@ -232,5 +327,13 @@ static void printCompare(raw_ostream &OutS, const CallBase *ICall)
 				OutS << "ok\n";
 			}
 		}
+	}
+}
+
+static void printICalls(raw_ostream &OutS, const std::vector<CallBase*> ICalls)
+{
+	for (auto &&ICall : ICalls)
+	{
+		LOG(ICall);
 	}
 }

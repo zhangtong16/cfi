@@ -2,3 +2,4 @@ build/
 thirdparty/
 bc/
 LKM/
+.vscode/
