@@ -11,7 +11,7 @@ using namespace llvm;
 static void
 printFLTAResult(raw_ostream &OutS, const SmallVector<FunctionType *> &Vals);
 static void
-printMapResult(raw_ostream &OutS, const llvm::DenseMap<FunctionType *, std::vector<Function *>> Type2Funcs);
+printTypeMapResult(raw_ostream &OutS, const llvm::DenseMap<FunctionType *, std::vector<Function *>> Type2Funcs);
 static void
 printICallTargets(raw_ostream &OutS, const std::vector<CallBase *> ICalls);
 static void
@@ -20,12 +20,16 @@ static void
 printCompare(raw_ostream &OutS, const CallBase *ICall);
 static void
 printICalls(raw_ostream &OutS, const std::vector<CallBase*> ICalls);
+static void
+printIDMapResult(raw_ostream &OutS, const llvm::DenseMap<uint64_t, std::vector<uint64_t>> ICallID2FuncID);
 
 #define LOG(X)                            \
 	X->print(llvm::errs());               \
 	llvm::errs() << "\n";                 \
 	X->getDebugLoc().print(llvm::errs()); \
 	llvm::errs() << "\n"
+
+#define DEBUG 1
 
 static std::vector<CallBase *> ICalls;
 static std::vector<FunctionType *> ICallTypes;
@@ -40,6 +44,11 @@ static llvm::DenseMap<FunctionType *, std::vector<Function *>> Type2Funcs; /* Th
 static std::vector<Constant *> FuncAddrs;
 // Initialized via makeICallAddrArray
 static std::vector<Constant *> ICallAddrs;
+
+// Containing the map from the ICall ID to Func ID.
+// ICall ID is the ICalladdr, Func ID is the FuncAddrs.
+// We assume that the order of these addrs keeps consistant.
+static llvm::DenseMap<uint64_t, std::vector<uint64_t>> ICallID2FuncID;
 
 static void
 createType2FuncMapping()
@@ -108,6 +117,9 @@ analysis(Module &M)
 	}
 }
 
+// Create ICallAddrArray -> [i8* * N]
+// an array contains the address of ICalls
+// N is determined in compile time
 static void
 makeICallAddrArray(Module &M)
 {
@@ -186,6 +198,74 @@ makeFuncAddrArray(Module &M)
 	FuncAddrArray->setSection(".func_addrs");
 }
 
+static uint64_t
+getFuncID(Function *Func)
+{
+	uint64_t id = 0;
+	auto it = std::find(AddrTakenFuncs.begin(), AddrTakenFuncs.end(), Func);
+
+	/* If not Found, It must be a fatal. */
+	assert(it != AddrTakenFuncs.end() 
+	       && "Can't find the FuncID!");
+	
+	assert(it >= AddrTakenFuncs.begin() 
+	       && "Something bad happend when look for FuncID!"); 
+	id = it - AddrTakenFuncs.begin();
+	return id;
+}
+
+static std::vector<uint64_t>
+getFuncIDList(std::vector<Function *> Funcs)
+{
+	std::vector<uint64_t> FuncIDs;
+	for (auto &&Func : Funcs)
+	{
+		FuncIDs.push_back(getFuncID(Func));
+	}
+	return FuncIDs;
+}
+
+static void
+makeICallID2FuncIDMapping()
+{
+	uint64_t ICallIDCounter = 0;
+
+	for (auto &&ICall : ICalls)
+	{
+		auto FuncIDs = getFuncIDList(resolveICallTarget(ICall));
+		ICallID2FuncID.insert(
+			std::pair<uint64_t, std::vector<uint64_t>>(
+				ICallIDCounter, 
+				FuncIDs
+			)
+		);
+		ICallIDCounter++;
+	}
+}
+
+// HashArray contains the value of `sha1(icall_addr xor icall_target)`
+// `icall_addr` and `icall_target` are determinded in load-time.
+// Which means the `sha1()` can only be evaluated in runtime.
+// Thus we also need a instrumentation to evaluate the sha1.
+// See `static void makeHashArrayEval()`
+static void
+makeHashArray()
+{
+
+}
+
+// Naive hash
+static void
+makeHashArrayEval()
+{
+
+}
+
+static void
+makeInstrumentCheck()
+{
+
+}
 
 
 FLTA::Result
@@ -202,6 +282,8 @@ FLTA::run(llvm::Module &M, llvm::ModuleAnalysisManager &)
 	runOnModule(M);
 	// printFuncs(llvm::errs(), AddrTakenFuncs);
 	createType2FuncMapping();
+	makeICallID2FuncIDMapping();
+	printIDMapResult(llvm::errs(), ICallID2FuncID);
 	// printCompare(llvm::errs(), (CallBase *)0x555556835b60);
 	// printMapResult(llvm::errs(), Type2Funcs);
 	// printFLTAResult(llvm::errs(), AddrTakenFuncTypes);
@@ -277,7 +359,7 @@ printFuncs(raw_ostream &OutS, const std::vector<Function *> Funcs)
 }
 
 static void
-printMapResult(raw_ostream &OutS, const llvm::DenseMap<FunctionType *, std::vector<Function *>> Type2Funcs)
+printTypeMapResult(raw_ostream &OutS, const llvm::DenseMap<FunctionType *, std::vector<Function *>> Type2Funcs)
 {
 	for (auto &Elem : Type2Funcs)
 	{
@@ -297,7 +379,30 @@ printMapResult(raw_ostream &OutS, const llvm::DenseMap<FunctionType *, std::vect
 	}
 }
 
-static void printICallTargets(raw_ostream &OutS, const std::vector<CallBase *> ICalls)
+static void
+printIDMapResult(raw_ostream &OutS, const llvm::DenseMap<uint64_t, std::vector<uint64_t>> ICallID2FuncID)
+{
+	for (auto &Elem : ICallID2FuncID)
+	{
+		OutS << "=================ICALL  ID===================";
+		OutS << "\n";
+		OutS << Elem.first << " ";
+		ICalls[Elem.first]->print(OutS);
+		OutS << "\n";
+		OutS << "=================FUNC   ID===================";
+		OutS << "\n";
+		for (auto &FuncID : Elem.second)
+		{
+			OutS << FuncID << " ";
+			OutS << AddrTakenFuncs[FuncID]->getName();
+			OutS << "\n";
+		}
+		OutS << "\n";
+		OutS << "\n";
+	}
+}
+
+static void printICallTargets(raw_ostream &OutS, const std::vector<CallBase *> &ICalls)
 {
 	for (auto &ICall : ICalls)
 	{
