@@ -371,7 +371,7 @@ makeLoopPrinterInstrument(Module &M, StringRef FName, enum PRINTEE Printee)
 {
 	Function *LoopPrinter = makeLoopPrinter(M);
 	Function *TargetFunc = M.getFunction(FName);
-	IRBuilder<> MainBuilder(&*TargetFunc->getEntryBlock().getFirstInsertionPt());
+	IRBuilder<> Builder(&*TargetFunc->getEntryBlock().getFirstInsertionPt());
 	std::vector<Value *> CalleeArgs;
 	GlobalVariable *GV = nullptr;
 	Value *BitCast = nullptr;
@@ -379,7 +379,7 @@ makeLoopPrinterInstrument(Module &M, StringRef FName, enum PRINTEE Printee)
 	{
 	case FUNC_ADDRS:
 		GV = M.getGlobalVariable(FUNC_ADDRS_SYMBOL, true);
-		BitCast = MainBuilder.CreateBitCast(
+		BitCast = Builder.CreateBitCast(
 						GV,
 						Type::getInt64PtrTy(M.getContext()));
 		CalleeArgs.push_back(BitCast);
@@ -389,7 +389,7 @@ makeLoopPrinterInstrument(Module &M, StringRef FName, enum PRINTEE Printee)
 		break;
 	case ICALL_ADDRS:
 		GV = M.getGlobalVariable(ICALL_ADDRS_SYMBOL, true);
-		BitCast = MainBuilder.CreateBitCast(
+		BitCast = Builder.CreateBitCast(
 						GV,
 						Type::getInt64PtrTy(M.getContext()));
 		CalleeArgs.push_back(BitCast);
@@ -402,7 +402,7 @@ makeLoopPrinterInstrument(Module &M, StringRef FName, enum PRINTEE Printee)
 		break;
 	}
 
-	MainBuilder.CreateCall(LoopPrinter, CalleeArgs);
+	Builder.CreateCall(LoopPrinter, CalleeArgs);
 }
 
 // Naive hash
