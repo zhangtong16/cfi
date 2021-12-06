@@ -2,6 +2,7 @@
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 #include "flta.h"
 #include "utils.h"
@@ -67,10 +68,21 @@ static std::vector<Constant *> ICallAddrs;
 #define LOOP_PRINTER "__cfi_loop_printer"
 enum PRINTEE {FUNC_ADDRS, ICALL_ADDRS};
 
+#define ICALL_CHECKER "__cfi_icall_checker"
+
 // Containing the map from the ICall ID to Func ID.
 // ICall ID is the ICalladdr, Func ID is the FuncAddrs.
 // We assume that the order of these addrs keeps consistant.
 static llvm::DenseMap<uint64_t, std::vector<uint64_t>> ICallID2FuncID;
+
+#define VoidTy Type::getVoidTy(M.getContext())
+#define I1Ty Type::getInt1Ty(M.getContext())
+#define I32Ty Type::getInt32Ty(M.getContext())
+#define I64Ty Type::getInt64Ty(M.getContext())
+
+#define I8PtrTy Type::getInt8PtrTy(M.getContext())
+#define I32PtrTy Type::getInt32PtrTy(M.getContext())
+#define I64PtrTy Type::getInt64PtrTy(M.getContext())
 
 static void
 createType2FuncMapping()
@@ -131,18 +143,22 @@ analysis(Module &M)
 				{
 					ICalls.push_back(CB);
 					ICallTypes.push_back(CB->getFunctionType());
+					// CB->getCalledOperand()->print(llvm::errs());
 				}
 			}
 		}
 	}
 }
 
-// Create ICallAddrArray -> [i8* * N]
+// Make ICallAddrArray -> [i8* X N]
 // an array contains the address of ICalls
 // N is determined in compile time
-static void
+static GlobalVariable *
 makeICallAddrArray(Module &M)
 {
+	GlobalVariable *ICallAddrArray = M.getNamedGlobal(ICALL_ADDRS_SYMBOL);
+	if (nullptr != ICallAddrArray)
+		return ICallAddrArray;
 	/* Break BB into two pieces. */
 	/* ICall is always at the front of the BB*/
 	for (auto &&ICall : ICalls)
@@ -156,28 +172,30 @@ makeICallAddrArray(Module &M)
 	}
 
 	ArrayType *ICallAddrArrayTy = ArrayType::get(
-		IntegerType::getInt8PtrTy(
-			M.getContext()),
-		ICalls.size());
+		I8PtrTy,
+		ICALL_ADDRS_LEN);
 	M.getOrInsertGlobal(ICALL_ADDRS_SYMBOL, ICallAddrArrayTy);
-	GlobalVariable *ICallAddrArray = M.getNamedGlobal(ICALL_ADDRS_SYMBOL);
+	ICallAddrArray = M.getNamedGlobal(ICALL_ADDRS_SYMBOL);
 	ICallAddrArray->setLinkage(GlobalValue::ExternalLinkage);
 	ICallAddrArray->setInitializer(
 		ConstantArray::get(
 			ArrayType::get(
-				Type::getInt8PtrTy(M.getContext()),
-				ICalls.size()),
+				I8PtrTy,
+				ICALL_ADDRS_LEN),
 			llvm::makeArrayRef(ICallAddrs)));
 	ICallAddrArray->setSection(ICALL_ADDRS_SECTION);
+	return ICallAddrArray;
 }
 
-// Create FuncAddrArray -> [i8* * N]
+// Make FuncAddrArray -> [i8* X N]
 // an array contains the address of address-taken functions
 // N is determined in compile time
-static void
+static GlobalVariable *
 makeFuncAddrArray(Module &M)
 {
-
+	GlobalVariable *FuncAddrArray = M.getNamedGlobal(FUNC_ADDRS_SYMBOL);
+	if (nullptr != FuncAddrArray)
+		return FuncAddrArray;
 	for (auto &Func : AddrTakenFuncs)
 	{
 		/* llvm::Function is llvm::Constant */
@@ -185,24 +203,23 @@ makeFuncAddrArray(Module &M)
 		FuncAddrs.push_back(
 			ConstantExpr::getBitCast(
 				Func,
-				PointerType::getInt8PtrTy(
-					M.getContext())));
+				I8PtrTy));
 	}
 
 	ArrayType *FuncAddrArrayTy = ArrayType::get(
-		IntegerType::getInt8PtrTy(
-			M.getContext()),
-		AddrTakenFuncs.size());
+		I8PtrTy,
+		FUNC_ADDRS_LEN);
 	M.getOrInsertGlobal(FUNC_ADDRS_SYMBOL, FuncAddrArrayTy);
-	GlobalVariable *FuncAddrArray = M.getNamedGlobal(FUNC_ADDRS_SYMBOL);
+	FuncAddrArray = M.getNamedGlobal(FUNC_ADDRS_SYMBOL);
 	FuncAddrArray->setLinkage(GlobalValue::ExternalLinkage);
 	FuncAddrArray->setInitializer(
 		ConstantArray::get(
 			ArrayType::get(
-				Type::getInt8PtrTy(M.getContext()),
-				AddrTakenFuncs.size()),
+				I8PtrTy,
+				FUNC_ADDRS_LEN),
 			llvm::makeArrayRef(FuncAddrs)));
 	FuncAddrArray->setSection(FUNC_ADDRS_SECTION);
+	return FuncAddrArray;
 }
 
 static uint64_t
@@ -230,7 +247,7 @@ getFuncIDList(std::vector<Function *> Funcs)
 }
 
 static void
-makeICallID2FuncIDMapping()
+CreateICallID2FuncIDMapping()
 {
 	uint64_t ICallIDCounter = 0;
 
@@ -243,18 +260,6 @@ makeICallID2FuncIDMapping()
 				FuncIDs));
 		ICallIDCounter++;
 	}
-}
-
-// HashArray contains the value of `sha1(icall_addr xor icall_target)`
-// `icall_addr` and `icall_target` are determinded in load-time.
-// Which means the `sha1()` can only be evaluated in runtime.
-// Thus we also need a instrumentation to evaluate the sha1.
-// See `static void makeHashArrayEval()`
-
-#define HASH_ARRAY_LENGTH 1000000
-static void
-makeHashArray()
-{
 }
 
 //////////////////////////// INSTRUMENTATION /////////////////////////////////
@@ -272,9 +277,9 @@ makeLoopPrinter(Module &M)
 
 	/* create printf(i8*, ...) declarations*/
 	std::vector<Type *> PrintfProtoTypeArgs;
-	PrintfProtoTypeArgs.push_back(Type::getInt8PtrTy(M.getContext()));
+	PrintfProtoTypeArgs.push_back(I8PtrTy);
 	FunctionType *PrintfTy = FunctionType::get(
-		Type::getInt32Ty(M.getContext()),
+		I32Ty,
 		true);
 
 	M.getOrInsertFunction("printf", PrintfTy);
@@ -282,11 +287,11 @@ makeLoopPrinter(Module &M)
 	//-----------------------------//
 	/* uint64_t *p, uint64_t len */
 	std::vector<Type *> ArgTys;
-	ArgTys.push_back(Type::getInt64PtrTy(M.getContext()));
-	ArgTys.push_back(Type::getInt32Ty(M.getContext()));
+	ArgTys.push_back(I64PtrTy);
+	ArgTys.push_back(I32Ty);
 	/* void (uint64_t *) */
 	FunctionType *FuncTy = FunctionType::get(
-		Type::getVoidTy(M.getContext()),
+		VoidTy,
 		ArgTys, false);
 	Func = Function::Create(
 		FuncTy,
@@ -301,7 +306,7 @@ makeLoopPrinter(Module &M)
 	auto *Arg2 = Args++;
 	Arg2->setName("len");
 
-	// create the entry basic block
+	// create the basic blocks
 	BasicBlock *EntryBB = BasicBlock::Create(M.getContext(), "entry", Func);
 	BasicBlock *ForCond = BasicBlock::Create(M.getContext(), "for.cond", Func);
 	BasicBlock *ForBody = BasicBlock::Create(M.getContext(), "for.body", Func);
@@ -312,12 +317,12 @@ makeLoopPrinter(Module &M)
 	IRBuilder<> Builder(EntryBB);
 	// %p.addr = alloca i64*
 	// %i      = alloc i32
-	auto *P_Addr = Builder.CreateAlloca(Type::getInt64PtrTy(M.getContext()), 0, "p.addr");
-	auto *I_Addr = Builder.CreateAlloca(Type::getInt32Ty(M.getContext()), 0, "i");
+	auto *P_Addr = Builder.CreateAlloca(I64PtrTy, 0, "p.addr");
+	auto *I_Addr = Builder.CreateAlloca(I32Ty, 0, "i");
 	// store i64* %p, i64** %p.addr
 	// store i32 0  , i32 %i*
 	Builder.CreateStore(Arg1, P_Addr);
-	Builder.CreateStore(ConstantInt::get(Type::getInt32Ty(M.getContext()), 0), I_Addr);
+	Builder.CreateStore(ConstantInt::get(I32Ty, 0), I_Addr);
 	// br label %for.cond
 	Builder.CreateBr(ForCond);
 	// for.cond
@@ -325,7 +330,7 @@ makeLoopPrinter(Module &M)
 	// %0 = load i32, i32* %i
 	// %cmp = icmp slt i32 %0, %len
 	// br i1 %cmp, label %for.body, label %for.end
-	auto I = Builder.CreateLoad(Type::getInt32Ty(M.getContext()), I_Addr);
+	auto I = Builder.CreateLoad(I32Ty, I_Addr);
 	auto CMP = Builder.CreateICmpSLT(I, Arg2);
 	Builder.CreateCondBr(CMP, ForBody, ForEnd);
 	// for.body
@@ -334,12 +339,12 @@ makeLoopPrinter(Module &M)
 	//  %Elem_Addr = getelementptr inbounds i64, i64* %P, i64 %I__64
 	//  %Elem = load i64, i64* %Elem_Addr
 	Builder.SetInsertPoint(ForBody);
-	auto P = Builder.CreateLoad(Type::getInt64PtrTy(M.getContext()), P_Addr);
+	auto P = Builder.CreateLoad(I64PtrTy, P_Addr);
 	auto I_64 = Builder.CreateSExt(
 		I,
-		Type::getInt64Ty(M.getContext()));
-	auto Elem_Addr = Builder.CreateGEP(Type::getInt64Ty(M.getContext()), P, I_64);
-	auto Elem = Builder.CreateLoad(Type::getInt64Ty(M.getContext()), Elem_Addr);
+		I64Ty);
+	auto Elem_Addr = Builder.CreateGEP(I64Ty, P, I_64);
+	auto Elem = Builder.CreateLoad(I64Ty, Elem_Addr);
 	// call @printf("%p\n", Elem)
 	std::vector<Value *> PrintArgs;
 	auto FormatStr = Builder.CreateGlobalStringPtr("%p\n");
@@ -350,11 +355,11 @@ makeLoopPrinter(Module &M)
 	Builder.CreateBr(ForInc);
 	// for.inc
 	Builder.SetInsertPoint(ForInc);
-	I = Builder.CreateLoad(Type::getInt32Ty(M.getContext()), I_Addr);
+	I = Builder.CreateLoad(I32Ty, I_Addr);
 	auto Inc = Builder.CreateNSWAdd(
 		I,
 		ConstantInt::get(
-			Type::getInt32Ty(M.getContext()),
+			I32Ty,
 			1));
 	Builder.CreateStore(Inc, I_Addr);
 	Builder.CreateBr(ForCond);
@@ -381,20 +386,20 @@ makeLoopPrinterInstrument(Module &M, StringRef FName, enum PRINTEE Printee)
 		GV = M.getGlobalVariable(FUNC_ADDRS_SYMBOL, true);
 		BitCast = Builder.CreateBitCast(
 						GV,
-						Type::getInt64PtrTy(M.getContext()));
+						I64PtrTy);
 		CalleeArgs.push_back(BitCast);
 		CalleeArgs.push_back(ConstantInt::get(
-						Type::getInt32Ty(M.getContext()),
+						I32Ty,
 						FUNC_ADDRS_LEN));
 		break;
 	case ICALL_ADDRS:
 		GV = M.getGlobalVariable(ICALL_ADDRS_SYMBOL, true);
 		BitCast = Builder.CreateBitCast(
 						GV,
-						Type::getInt64PtrTy(M.getContext()));
+						I64PtrTy);
 		CalleeArgs.push_back(BitCast);
 		CalleeArgs.push_back(ConstantInt::get(
-						Type::getInt32Ty(M.getContext()),
+						I32Ty,
 						ICALL_ADDRS_LEN));
 		break;
 	default:
@@ -405,34 +410,148 @@ makeLoopPrinterInstrument(Module &M, StringRef FName, enum PRINTEE Printee)
 	Builder.CreateCall(LoopPrinter, CalleeArgs);
 }
 
-// Naive hash
-static void
-makeHashArrayEval()
+static Function *
+makeICallChecker(Module &M)
 {
+	// check if we had make ICallChecker earlier.
+	auto Func = M.getFunction(ICALL_CHECKER);
+	if (nullptr != Func)
+	{
+		return Func;
+	}
+
+	/*(i64, i8*)*/
+	std::vector<Type *> ArgTys;
+	ArgTys.push_back(I64Ty);
+	ArgTys.push_back(I64Ty);
+	
+	/* i32 (*__cfi_icall_checker)(i64, i64)*/
+	FunctionType *FuncTy = FunctionType::get(
+		I32Ty,
+		ArgTys, false);
+	Func = Function::Create(
+		FuncTy,
+		Function::ExternalLinkage,
+		ICALL_CHECKER,
+		M);
+
+	// prepare the args' names
+	auto Args = Func->arg_begin();
+	auto *Arg1 = Args++;
+	Arg1->setName("func_id");
+	auto *Arg2 = Args++;
+	Arg2->setName("target");
+
+	// create the basic blocks
+	BasicBlock *EntryBB = BasicBlock::Create(M.getContext(), "entry", Func);
+	BasicBlock *IfThenBB = BasicBlock::Create(M.getContext(), "if.then", Func);
+	BasicBlock *IfElseBB = BasicBlock::Create(M.getContext(), "if.else", Func);
+	BasicBlock *RetBB = BasicBlock::Create(M.getContext(), "return", Func);
+
+	// entry
+	IRBuilder<> Builder(EntryBB);
+	auto RetVal = Builder.CreateAlloca(I32Ty, 0, "retval");
+	auto FunIDAddr = Builder.CreateAlloca(I64Ty, 0, "func_id.addr");
+	auto TargetAddr = Builder.CreateAlloca(I64Ty, 0, "target.addr");
+
+	Builder.CreateStore(Arg1, FunIDAddr);
+	Builder.CreateStore(Arg2, TargetAddr);
+
+	auto FunID = Builder.CreateLoad(I64Ty, FunIDAddr);
+
+	auto FunAddrArray = M.getNamedGlobal(FUNC_ADDRS_SYMBOL);
+	auto BitCast = Builder.CreateBitCast(FunAddrArray, I64PtrTy);
+	auto GEP = Builder.CreateGEP(BitCast, FunID);
+	  
+	auto ExpectedTarget = Builder.CreateLoad(I64Ty, GEP);	
+	auto Target = Builder.CreateLoad(I64Ty, TargetAddr);
+
+	auto CMP = Builder.CreateICmpEQ(ExpectedTarget, Target);
+	Builder.CreateCondBr(CMP, IfThenBB, IfElseBB);
+
+	// if.then
+	Builder.SetInsertPoint(IfThenBB);
+	Builder.CreateStore(ConstantInt::get(I32Ty, 0), RetVal);
+	Builder.CreateBr(RetBB);
+
+	// if.else
+	Builder.SetInsertPoint(IfElseBB);
+	Builder.CreateStore(ConstantInt::get(I32Ty, -1), RetVal);
+	Builder.CreateBr(RetBB);
+ 
+	// ret
+	Builder.SetInsertPoint(RetBB);
+	auto Ret = Builder.CreateLoad(I32Ty, RetVal);
+	Builder.CreateRet(Ret);
+	return Func;
 }
 
 static void
-makeInstrumentCheck()
+makeICallCheckerInstrument(Module &M)
 {
+	auto Func = makeICallChecker(M);
+	uint64_t Counter = 0;
+	std::vector<Value *> ICallCheckerArgs;
+	llvm::SmallVector<Value *> RetVals;
+
+	/* create abort(void) declarations*/
+	std::vector<Type *> AbortProtoTypeArgs;
+	AbortProtoTypeArgs.push_back(VoidTy);
+	FunctionType *AbortTy = FunctionType::get(VoidTy, true);
+	M.getOrInsertFunction("abort", AbortTy);
+	Function *Abort = M.getFunction("abort");
+	std::vector<Value *> AbortArgs;
+
+	for (auto &&ICall : ICalls)
+	{
+		// get target's IDs
+		auto Iter = ICallID2FuncID.find(Counter);
+		assert(Iter != ICallID2FuncID.end() && "Can not find target!!!!");
+		auto Targets = (*Iter).second;
+		IRBuilder<> Builder(ICall);
+		AbortArgs.clear();
+		RetVals.clear();
+		RetVals.push_back(ConstantInt::get(I32Ty, -1));
+		for (auto &&TargetID : Targets)
+		{
+			ICallCheckerArgs.clear();	
+			auto FuncAddr = Builder.CreatePtrToInt(ICall->getCalledOperand(), I64Ty);
+			ICallCheckerArgs.push_back(ConstantInt::get(I64Ty, TargetID));
+			ICallCheckerArgs.push_back(FuncAddr);
+			auto RetVal = Builder.CreateCall(Func, ICallCheckerArgs);
+			RetVals.push_back(RetVal);
+		}
+		
+		auto Res = Builder.CreateAnd(RetVals);
+		auto CMP = Builder.CreateICmpNE(Res, ConstantInt::get(I32Ty, 0));
+		auto Term = SplitBlockAndInsertIfThen(CMP, ICall, false);
+		
+		Builder.SetInsertPoint(Term);
+		// BOOM
+	 	Builder.CreateCall(Abort, AbortArgs);	
+		Counter++; 
+	}
+	
 }
 
 FLTA::Result
 FLTA::runOnModule(Module &M)
 {
 	analysis(M);
-	makeICallAddrArray(M);
-	makeFuncAddrArray(M);
-	makeLoopPrinterInstrument(M, "main", FUNC_ADDRS);
-	makeLoopPrinterInstrument(M, "main", ICALL_ADDRS);
+	createType2FuncMapping();
+	CreateICallID2FuncIDMapping();
 }
 
 PreservedAnalyses
 FLTA::run(llvm::Module &M, llvm::ModuleAnalysisManager &)
 {
 	runOnModule(M);
+	makeICallAddrArray(M);
+	makeFuncAddrArray(M);
+	makeLoopPrinterInstrument(M, "main", FUNC_ADDRS);
+	makeLoopPrinterInstrument(M, "main", ICALL_ADDRS);
+	makeICallCheckerInstrument(M);
 	// printFuncs(llvm::errs(), AddrTakenFuncs);
-	createType2FuncMapping();
-	makeICallID2FuncIDMapping();
 	// printIDMapResult(llvm::errs(), ICallID2FuncID);
 	// printCompare(llvm::errs(), (CallBase *)0x555556835b60);
 	// printMapResult(llvm::errs(), Type2Funcs);
