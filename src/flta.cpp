@@ -494,13 +494,22 @@ makeICallCheckerInstrument(Module &M)
 	std::vector<Value *> ICallCheckerArgs;
 	llvm::SmallVector<Value *> RetVals;
 
-	/* create abort(void) declarations*/
+	/* create void abort(void) declarations */
 	std::vector<Type *> AbortProtoTypeArgs;
 	AbortProtoTypeArgs.push_back(VoidTy);
 	FunctionType *AbortTy = FunctionType::get(VoidTy, true);
 	M.getOrInsertFunction("abort", AbortTy);
 	Function *Abort = M.getFunction("abort");
 	std::vector<Value *> AbortArgs;
+
+	/* create i32 dprintf(i32, i8*, ...) declarations */
+	std::vector<Type *> DprintfProtoTypeArgs;
+	DprintfProtoTypeArgs.push_back(I32Ty);
+	DprintfProtoTypeArgs.push_back(I8PtrTy);
+	FunctionType *PrintfTy = FunctionType::get(I32Ty, true);
+	M.getOrInsertFunction("dprintf", PrintfTy);
+	Function *Dprintf = M.getFunction("dprintf");
+	std::vector<Value *> DprintfArgs;
 
 	for (auto &&ICall : ICalls)
 	{
@@ -528,6 +537,11 @@ makeICallCheckerInstrument(Module &M)
 		
 		Builder.SetInsertPoint(Term);
 		// BOOM
+		// stderr => 2
+		DprintfArgs.push_back(ConstantInt::get(I32Ty, 2));
+		auto FormatStr = Builder.CreateGlobalStringPtr("CFI violation detected!!!\n");
+		DprintfArgs.push_back(FormatStr);
+		Builder.CreateCall(Dprintf, DprintfArgs);
 	 	Builder.CreateCall(Abort, AbortArgs);	
 		Counter++; 
 	}
