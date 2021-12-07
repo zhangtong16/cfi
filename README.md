@@ -2,6 +2,10 @@
 
 This is a Type-based Control Flow Integrity enforcement implementation build on top of LLVM compiler infrastructure.
 
+We use the skeleton of [llvm-tutor](https://github.com/banach-space/llvm-tutor).
+
+This enforcement should protect you from corrupted code pointers. However, it actually is a coarse-grain implementation because of its `Naïve` type analysis.
+
 Currently, there are two phases:
 
 1. __Type Analysis for ICalls__. We currently use `FLTA`, which means First Layer Type Analysis, to analyze the type of icalls, and resolve the candidate targets set.
