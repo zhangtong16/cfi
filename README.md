@@ -8,7 +8,10 @@ This enforcement should protect you from corrupted code pointers. However, it ac
 
 Currently, there are two phases:
 
-1. __Type Analysis for ICalls__. We currently use `FLTA`, which means First Layer Type Analysis, to analyze the type of icalls, and resolve the candidate targets set.
+1. __Type Analysis for ICalls__. We currently use `FLTA`, which means First Layer Type Analysis , to analyze the type of icalls, and resolve the candidate targets set.
+
+The concepts of `FLTA` is from [Where Does It Go?](https://www-users.cse.umn.edu/~kjlu/papers/mlta.pdf) 
+
 2. __Instrumentation for Runtime Check__. Before every icalls, we insert checks to determine the target is in the candidate sets.
 
 ## Features
