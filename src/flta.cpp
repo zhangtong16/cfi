@@ -562,8 +562,10 @@ FLTA::run(llvm::Module &M, llvm::ModuleAnalysisManager &)
 	runOnModule(M);
 	makeICallAddrArray(M);
 	makeFuncAddrArray(M);
+	#if DEBUG
 	makeLoopPrinterInstrument(M, "main", FUNC_ADDRS);
 	makeLoopPrinterInstrument(M, "main", ICALL_ADDRS);
+	#endif
 	makeICallCheckerInstrument(M);
 	// printFuncs(llvm::errs(), AddrTakenFuncs);
 	// printIDMapResult(llvm::errs(), ICallID2FuncID);
