@@ -2,10 +2,13 @@
 # ======================================================
 set(LLVM_TUTOR_PLUGINS
     FLTA
+    MLTA
     )
 
 set(FLTA_SOURCES
   flta.cpp)
+set(MLTA_SOURCES
+  mlta.cpp)
 
 
 # CONFIGURE THE PLUGIN LIBRARIES

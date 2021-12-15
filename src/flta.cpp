@@ -264,6 +264,7 @@ CreateICallID2FuncIDMapping()
 
 //////////////////////////// INSTRUMENTATION /////////////////////////////////
 
+#if DEBUG
 // instrument a loop to print an array of addrs
 static Function *
 makeLoopPrinter(Module &M)
@@ -409,6 +410,7 @@ makeLoopPrinterInstrument(Module &M, StringRef FName, enum PRINTEE Printee)
 
 	Builder.CreateCall(LoopPrinter, CalleeArgs);
 }
+#endif
 
 static Function *
 makeICallChecker(Module &M)
@@ -461,7 +463,7 @@ makeICallChecker(Module &M)
 
 	auto FunAddrArray = M.getNamedGlobal(FUNC_ADDRS_SYMBOL);
 	auto BitCast = Builder.CreateBitCast(FunAddrArray, I64PtrTy);
-	auto GEP = Builder.CreateGEP(BitCast, FunID);
+	auto GEP = Builder.CreateGEP(I64Ty, BitCast, FunID);
 	  
 	auto ExpectedTarget = Builder.CreateLoad(I64Ty, GEP);	
 	auto Target = Builder.CreateLoad(I64Ty, TargetAddr);

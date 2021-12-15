@@ -160,4 +160,19 @@ bool isIdenticalType(const llvm::Type *left, const llvm::Type *right)
     return __isIdenticalType(left, right);
 }
 
+bool isFuncPtrTy(const llvm::Type *Ty)
+{
+    auto *PTy = llvm::dyn_cast<llvm::PointerType>(Ty);
+    if (nullptr != PTy)
+    {
+        return isFuncPtrTy(PTy->getElementType());
+    }
+
+    if (Ty->isFunctionTy())
+    {
+        return true;
+    }
+
+    return false;
+}
 #endif // __UTILS_H
