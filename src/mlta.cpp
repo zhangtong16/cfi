@@ -7,327 +7,45 @@
 
 using namespace llvm;
 
-#define DEBUG 0
-
-#define LOG(x)              \
-    x->print(llvm::errs()); \
-    llvm::errs() << "\n"
-#define LOG_STR(x) llvm::errs() << x << "\n"
+#define DEBUG 1
 
 static std::vector<Function *> AddrTakenFuncs;
 static std::vector<CallBase *> ICalls;
 
-static llvm::DenseMap<std::pair<Value *, Value *>, std::vector<Value *>> InstPaths;
-static llvm::DenseMap<std::pair<Value *, Value *>, std::vector<Value *>> GVPaths;
-static std::vector<Value *> Path;
-static std::unordered_set<PHINode *> VisitedPHINodes;
-static std::unordered_set<GlobalVariable *> VisitedGlobalVars;
-
 static std::unordered_set<llvm::Function *> GVFuncs;
 static std::unordered_set<llvm::Function *> InstFuncs;
 
-#if DEBUG
-static void
-printPath(raw_ostream &OutS, const llvm::DenseMap<std::pair<Value *, Value *>, std::vector<Value *>> InstPaths);
-static void
-printContainedFuncs(raw_ostream &OutS, const std::unordered_set<Function *> ContainedFPtrs);
+///////////////////////////////////////////////////////////////////
+//// (func, use) -> [path]
+static std::map<std::pair<Value *, Value *>, std::vector<Value *>> InstPaths;
+static std::map<std::pair<Value *, Value *>, std::vector<Value *>> GVPaths;
+//// helper data structures
+static std::vector<Value *> Path;
+static std::unordered_set<PHINode *> VisitedPHINodes;
+static std::unordered_set<Value *> VisitedConstants;
+static bool STOREINST = false;
+
+///////////////////////////////////////////////////////////////////
+//// Type only analysis data strutures
+using IndiceTy = uint32_t;
+using StructIdx = std::pair<Type *, IndiceTy>;
+using FuncStructMap = std::map<Type *, std::vector<StructIdx>>;
+static FuncStructMap FP2S;
+using Struct2StructMap = std::map<Type *, std::vector<StructIdx>>;
+static Struct2StructMap S2S;
+
+#ifdef DEBUG
+static void printFP2StructMapping();
+static void printS2SMapping();
+static void printFuncs();
+static void printPaths(std::map<std::pair<Value *, Value *>, std::vector<Value *>> Paths);
 #endif
 
-// we assume that a InstPath is consisted with
-// [select, phi_node, or store] -> [gep, load] -> alloca/global/call/args
-// `Val` will be a `class User`
-// `class User` can be divided into 4 categories:
-//   1. Instruction
-//   2. Operator
-//   3. Constant <- ConstantExpr (we do not consider it)
-//   4. DerivedUser (we do not consider it)
-//   5. GlobalVariable
-// Example:
-// `getelementptr` has 3 implementations:
-//   1. GetElementPtrConstantExpr (may be not used?)
-//   2. GetElementPtrInst
-//   3. GEPOperator
-// We need handle these.
-// if `Val` is a AllocaInst, or a GlobalVariable, return
-static void
-getInstPath(Value *Val)
-{
-    if (isa<Instruction>(Val))
-    {
-
-        if (isa<CallBase>(Val) || isa<ICmpInst>(Val))
-        {
-            Path.push_back(Val);
-            return;
-        }
-        // store value, ptr
-        if (auto SI = dyn_cast<StoreInst>(Val))
-        {
-            Path.push_back(SI);
-            getInstPath(SI->getPointerOperand());
-            return;
-        }
-        // value = getelementptr ptr, 0, index
-        if (auto GEPI = dyn_cast<GetElementPtrInst>(Val))
-        {
-            Path.push_back(GEPI);
-            // There are some codes which gep from a func_pointer.
-            // check BPF JIT.
-            // terminator.
-            if (isFuncPtrTy(GEPI->getPointerOperand()->stripPointerCasts()->getType()))
-            {
-                return;
-            }
-            getInstPath(GEPI->getPointerOperand());
-            return;
-        }
-        // value = load ptr
-        if (auto LI = dyn_cast<LoadInst>(Val))
-        {
-            Path.push_back(LI);
-            getInstPath(LI->getPointerOperand());
-            return;
-        }
-        // value = alloc. terminator.
-        if (auto LI = dyn_cast<AllocaInst>(Val))
-        {
-            Path.push_back(LI);
-            return;
-        }
-        // bitcast value to <ty>
-        if (auto BC = dyn_cast<BitCastInst>(Val))
-        {
-            Path.push_back(BC);
-            // BitCastInst is a UnaryInstruction
-            getInstPath(BC->getOperand(0));
-            return;
-        }
-        // value = select i1, val1, val2
-        if (auto SI = dyn_cast<SelectInst>(Val))
-        { // if val1 is fptr <ty>. We need track value.
-            if (isFuncPtrTy(SI->getTrueValue()->stripPointerCasts()->getType()) ||
-                isFuncPtrTy(SI->getFalseValue()->stripPointerCasts()->getType()))
-            {
-                Path.push_back(SI);
-                for (auto &&U : SI->users())
-                {
-                    getInstPath(U);
-                }
-            }
-            else
-            {
-                Path.push_back(SI);
-                getInstPath(SI->getTrueValue());
-                getInstPath(SI->getFalseValue());
-            }
-
-            return;
-        }
-        // value = phi [val1, label1], [val2, label2]
-        if (auto PN = dyn_cast<PHINode>(Val))
-        {
-            // if PHINode close a loop, there may be recusive PHINodes.
-            // %53 = phi %49, %147
-            // %147 = phi %84, %53
-            // We must break this infinite recusive.
-            if (VisitedPHINodes.find(PN) != VisitedPHINodes.end())
-            {
-                Path.push_back(Val);
-                return;
-            }
-            VisitedPHINodes.insert(PN);
-
-            bool NeedTrack = false;
-            for (auto &&InComingVal : PN->incoming_values())
-            {
-                if (isFuncPtrTy(InComingVal->stripPointerCasts()->getType()))
-                {
-                    NeedTrack = true;
-                    break;
-                }
-            }
-            // %0 = phi [bitcast func1 to <ty>, label], []
-            // %1 = phi [func1, label], [func2, label2]
-            // Store %1, addr
-            if (NeedTrack)
-            {
-                Path.push_back(PN);
-                for (auto &&U : PN->users())
-                {
-                    getInstPath(U);
-                }
-            }
-            else
-            {
-                Path.push_back(PN);
-                for (auto &&InComingVal : PN->incoming_values())
-                {
-                    getInstPath(InComingVal);
-                }
-            }
-            return;
-        }
-        // int2ptr cast. terminator
-        if (auto I2PI = dyn_cast<IntToPtrInst>(Val))
-        {
-            Path.push_back(I2PI);
-            return;
-        }
-        // return. terminator
-        if (auto RI = dyn_cast<ReturnInst>(Val))
-        {
-            Path.push_back(RI);
-            return;
-        }
-        // add, sub, mult, div ... terminator.
-        if (auto BOI = dyn_cast<BinaryOperator>(Val))
-        {
-            Path.push_back(BOI);
-            return;
-        }
-
-        LOG(Val);
-        assert(false && "The Val is a instruction but we cannot handle!!!");
-    }
-
-    if (isa<Operator>(Val))
-    {
-        if (auto GEPOp = dyn_cast<GEPOperator>(Val))
-        {
-            Path.push_back(GEPOp);
-            getInstPath(GEPOp->getPointerOperand());
-            return;
-        }
-        if (auto BCOp = dyn_cast<BitCastOperator>(Val))
-        {
-            if (Path.empty())
-            {
-                // bitcast func to <ty>
-                // Store bitcast func to <ty>, addr
-                // Then we need handle Store
-                Path.push_back(BCOp);
-                for (auto &&U : BCOp->users())
-                {
-                    getInstPath(U);
-                }
-            }
-            else
-            {
-                // bitcast addr to <ty>
-                // Store func, bitcast addr to <ty>
-                // Then We need handle addr
-                Path.push_back(BCOp);
-                Path.push_back(BCOp->getOperand(0));
-            }
-            return;
-        }
-
-        if (auto P2IOp = dyn_cast<PtrToIntOperator>(Val))
-        {
-            Path.push_back(P2IOp);
-            for (auto &&U : P2IOp->users())
-            {
-                getInstPath(U);
-            }
-            return;
-        }
-    }
-    // some terminators.
-    if (isa<ConstantData>(Val) || isa<ConstantExpr>(Val) || isa<ConstantAggregate>(Val) || isa<GlobalVariable>(Val) || isa<Argument>(Val) || isa<BlockAddress>(Val))
-    {
-        Path.push_back(Val);
-        return;
-    }
-    // In case we miss some check, add this to break;
-    if (isa<Function>(Val))
-    {
-        return;
-    }
-    LOG(Val);
-    assert(false && "We do not know which Type the Val is!!!\n");
-}
-
-static void
-getGVPath(Value *Val)
-{
-    if (isa<Instruction>(Val))
-    {
-        return;
-    }
-
-       // These Constants my be used as unamed global values
-    if (isa<GlobalAlias>(Val) || isa<BlockAddress>(Val) || isa<ConstantAggregate>(Val) || isa<ConstantData>(Val) || isa<ConstantExpr>(Val))
-    {
-        auto Const = dyn_cast<Constant>(Val);
-        Path.push_back(Const);
-        for (auto &&User : Const->users())
-        {
-            getGVPath(User);
-        }
-        return;
-    }
-
-    if (isa<Operator>(Val))
-    {
-        if (auto GEPOp = dyn_cast<GEPOperator>(Val))
-        {
-            Path.push_back(GEPOp);
-            for (auto &&User : GEPOp->users())
-            {
-                if (!isa<Instruction>(User))
-                    getGVPath(User);
-            }
-            return;
-        }
-
-        if (auto BCOp = dyn_cast<BitCastOperator>(Val))
-        {
-            Path.push_back(BCOp);
-            for (auto &&User : BCOp->users())
-            {
-                if (!isa<Instruction>(User))
-                    getGVPath(User);
-            }
-            return;
-        }
-
-        if (auto P2IOp = dyn_cast<PtrToIntOperator>(Val))
-        {
-            Path.push_back(P2IOp);
-            for (auto &&User : P2IOp->users())
-            {
-                if (!isa<Instruction>(User))
-                    getGVPath(User);
-            }
-            return;
-        }
-        LOG(Val);
-        assert(false && "Unhandled Operators!!!");
-    }
-
- 
-
-    if (auto GV = dyn_cast<GlobalVariable>(Val))
-    {
-        // break up the recusive chain.
-        if (VisitedGlobalVars.find(GV) != VisitedGlobalVars.end())
-        {
-            Path.push_back(GV);
-            return;
-        }
-        VisitedGlobalVars.insert(GV);
-        Path.push_back(GV);
-
-        for (auto &&User : GV->users())
-        {
-            getGVPath(User);
-        }
-        return;
-    }
-
-    LOG(Val);
-    assert(false && "Unhandled corner case!!!");
-}
+static bool isGVFunc(User *U);
+static bool isInstFunc(User *U);
+static void getInstPath(Value *Val);
+static void getGVPath(Value *Val);
+static void addMapping(std::map<Type *, std::vector<StructIdx>> &Map, Type *Key, StructIdx ValueElem);
 
 static void
 analysis(Module &M)
@@ -339,9 +57,7 @@ analysis(Module &M)
         {
             AddrTakenFuncs.push_back(&Func);
         }
-
         for (auto &BB : Func)
-        {
             for (auto &Inst : BB)
             {
                 auto *CB = dyn_cast<CallBase>(&Inst);
@@ -350,139 +66,341 @@ analysis(Module &M)
                     ICalls.push_back(CB);
                 }
             }
-        }
     }
-}
-
-static bool
-isGVContained(User *U)
-{
-    bool isContained = false;
-
-    if (nullptr == U || isa<Instruction>(U))
-    {
-        return false;
-    }
-
-    if (isa<GlobalVariable>(U))
-    {
-        return true;
-    }
-
-    for (auto &&User : U->users())
-    {
-        if (isGVContained(User))
-        {
-            isContained = true;
-            break;
-        }
-    }
-    return isContained;
-}
-
-static bool
-isInstContained(User *U)
-{
-    bool isContained = false;
-
-    if (nullptr == U || isa<GlobalVariable>(U) || isa<CallBase>(U))
-    {
-        return false;
-    }
-    if (isa<StoreInst>(U) || isa<SelectInst>(U) || isa<PHINode>(U))
-    {
-        return true;
-    }
-    for (auto &&User : U->users())
-    {
-        if (isInstContained(User))
-        {
-            isContained = true;
-            break;
-        }
-    }
-    return isContained;
 }
 
 static void
-collectContainedFunc()
+divideFunc()
 {
     for (auto &&Func : AddrTakenFuncs)
     {
-        if (isGVContained(Func))
-        {
+        if (isGVFunc(Func))
             GVFuncs.insert(Func);
-        }
-        if (isInstContained(Func))
-        {
+        if (isInstFunc(Func))
             InstFuncs.insert(Func);
-        }
     }
 }
 
 static void
-getFuncInstPath()
+getInstFuncPath()
 {
     for (auto &&Func : InstFuncs)
-    {
-        for (auto &&User : Func->users())
+        for (auto &&U : Func->users())
         {
+            STOREINST = false;
             Path.clear();
             VisitedPHINodes.clear();
-            getInstPath(User);
-            if (!Path.empty())
+            getInstPath(U);
+            if (!Path.empty() && STOREINST)
             {
-                auto Pair1 = std::pair<Value *, Value *>(Func, User);
+                auto Pair1 = std::pair<Value *, Value *>(Func, U);
                 auto Pair2 = std::pair<std::pair<Value *, Value *>, std::vector<Value *>>(Pair1, Path);
                 InstPaths.insert(Pair2);
             }
         }
-    }
-
-    for (auto &&Path : InstPaths)
-    {
-        if (Path.getSecond().size() == 1)
-        {
-            InstPaths.erase(Path.getFirst());
-        }
-    }
+    // clean
     Path.clear();
 }
 
 static void
-getFuncGVPath()
+getGVFuncPath()
 {
     for (auto &&Func : GVFuncs)
-    {
-        for (auto &&User : Func->users())
+        for (auto &&U : Func->users())
         {
             Path.clear();
-            VisitedGlobalVars.clear();
-            getGVPath(User);
+            VisitedConstants.clear();
+            getGVPath(U);
             if (!Path.empty())
             {
-                auto Pair1 = std::pair<Value *, Value *>(Func, User);
+                auto Pair1 = std::pair<Value *, Value *>(Func, U);
                 auto Pair2 = std::pair<std::pair<Value *, Value *>, std::vector<Value *>>(Pair1, Path);
                 GVPaths.insert(Pair2);
             }
         }
-    }
+    // clean
     Path.clear();
+}
+
+static void
+makeMapping(Module &M)
+{
+    for (auto &&StructTy : M.getIdentifiedStructTypes())
+    {
+        for (unsigned int i = 0; i < StructTy->getNumElements(); i++)
+        {
+            auto ElemType = extractTy(StructTy->getElementType(i));
+
+            if (ElemType->isIntegerTy())
+            {
+                continue;
+            }
+            if (ElemType->isStructTy())
+            {
+                if ((ElemType->getNumContainedTypes() != 0))
+                    addMapping(S2S, ElemType, StructIdx(StructTy, i));
+                continue;
+            }
+            if (isFuncPtrTy(ElemType))
+            {
+                addMapping(FP2S, ElemType, StructIdx(StructTy, i));
+                continue;
+            }
+
+            LOG(ElemType);
+            LOG(StructTy);
+            llvm_unreachable("Unknown Type!!!");
+        }
+    }
 }
 
 void MLTA::runOnModule(Module &M)
 {
+    makeMapping(M);
     analysis(M);
-    collectContainedFunc();
-    getFuncInstPath();
-    getFuncGVPath();
+    divideFunc();
+    getInstFuncPath();
+    getGVFuncPath();
 }
 
 PreservedAnalyses
 MLTA::run(llvm::Module &M, llvm::ModuleAnalysisManager &)
 {
     runOnModule(M);
+    // printFuncs();
+    printPaths(GVPaths);
     return PreservedAnalyses::none();
+}
+
+// An valid InstPath is consisted with
+// [select/phi/store] -> [gep/load] -> [alloc/global val/call/args]
+// source -------------> propagation-> sink
+static void
+getInstPath(Value *Val)
+{
+    if (isa<Instruction>(Val))
+    {
+        // sink
+        if (isa<CallBase>(Val) || isa<ICmpInst>(Val) || isa<AllocaInst>(Val) || isa<BinaryOperator>(Val) || isa<ReturnInst>(Val) || isa<IntToPtrInst>(Val) || isa<AllocaInst>(Val))
+        {
+            Path.push_back(Val);
+            return;
+        }
+
+        // source
+        // StoreInst is necessary
+        if (auto SI = dyn_cast<StoreInst>(Val))
+        {
+            Path.push_back(SI);
+            STOREINST = true;
+            getInstPath(SI->getPointerOperand());
+            return;
+        }
+        if (auto PN = dyn_cast<PHINode>(Val))
+        {
+            if (VisitedPHINodes.find(PN) != VisitedPHINodes.end())
+                return;
+            VisitedPHINodes.insert(PN);
+
+            Path.push_back(PN);
+
+            bool TrackUser = false;
+            for (auto &&InComingVal : PN->incoming_values())
+            {
+                if (isFuncPtrTy(InComingVal->stripPointerCasts()->getType()))
+                {
+                    TrackUser = true;
+                    break;
+                }
+            }
+            if (TrackUser)
+            {
+                for (auto &&U : PN->users())
+                    getInstPath(U);
+            }
+            else
+            {
+                for (auto &&InComingVal : PN->incoming_values())
+                    getInstPath(InComingVal);
+            }
+            return;
+        }
+        if (auto SI = dyn_cast<SelectInst>(Val))
+        {
+            Path.push_back(SI);
+            if (isFuncPtrTy(SI->getTrueValue()->stripPointerCasts()->getType()) || isFuncPtrTy(SI->getFalseValue()->stripPointerCasts()->getType()))
+            {
+                for (auto &&U : SI->users())
+                    getInstPath(U);
+            }
+            else
+            {
+                getInstPath(SI->getTrueValue());
+                getInstPath(SI->getFalseValue());
+            }
+            return;
+        }
+
+        // propagation
+        if (auto LI = dyn_cast<LoadInst>(Val))
+        {
+            Path.push_back(LI);
+            getInstPath(LI->getPointerOperand());
+            return;
+        }
+        if (auto GEPI = dyn_cast<GetElementPtrInst>(Val))
+        {
+            Path.push_back(GEPI);
+            if (isFuncPtrTy(GEPI->getPointerOperand()->stripPointerCasts()->getType()))
+            { // some case using gep to get fptr
+                return;
+            }
+            getInstPath(GEPI->getPointerOperand());
+            return;
+        }
+        if (auto BC = dyn_cast<BitCastInst>(Val))
+        {
+            Path.push_back(BC);
+            getInstPath(BC->getOperand(0));
+            return;
+        }
+        LOG(Val);
+        llvm_unreachable("The Val is a Instruction but we cannot handle!!!");
+    }
+    if (isa<Operator>(Val))
+    {
+        // propagation
+        if (auto GEPOp = dyn_cast<GEPOperator>(Val))
+        {
+            Path.push_back(GEPOp);
+            getInstPath(GEPOp->getPointerOperand());
+            return;
+        }
+        if (auto BCOp = dyn_cast<BitCastOperator>(Val))
+        {
+            Path.push_back(BCOp);
+            // bitcast func to <ty>
+            if (Path.empty())
+                for (auto &&U : BCOp->users())
+                    getInstPath(U);
+            // bitcast %reg to <ty>
+            else
+                Path.push_back(BCOp->getOperand(0));
+            return;
+        }
+        if (auto P2IOp = dyn_cast<PtrToIntOperator>(Val))
+        {
+            Path.push_back(P2IOp);
+            for (auto &&U : P2IOp->users())
+                getInstPath(U);
+            return;
+        }
+    }
+    // sink
+    if (isa<Argument>(Val) || isa<Constant>(Val))
+    {
+        Path.push_back(Val);
+        return;
+    }
+
+    LOG(Val);
+    llvm_unreachable("We do not know which Type the Val is!!!");
+}
+
+static void
+getGVPath(Value *Val)
+{
+    if (isa<Constant>(Val))
+    {
+        if (VisitedConstants.find(Val) != VisitedConstants.end())
+            return;
+        VisitedConstants.insert(Val);
+        Path.push_back(Val);
+
+        for (auto &&U : Val->users())
+        {
+            if (!isa<Instruction>(U))
+                getGVPath(U);
+        }
+        return;
+    }
+
+    // BitCast, GEP, Ptr2int, ...
+    if (isa<Operator>(Val))
+    {
+        LOG_STR("Operator");
+        for (auto &&U : Val->users())
+            if (!isa<Instruction>(U))
+            {
+                Path.push_back(Val);
+                getGVPath(Val);
+            }
+        return;
+    }
+
+    if (isa<Instruction>(Val) || nullptr == Val)
+        return;
+    LOG(Val);
+    llvm_unreachable("Unhandled GVPath!!!");
+}
+
+static bool
+isGVFunc(User *U)
+{
+    bool rc = false;
+    if (nullptr == U || isa<Instruction>(U))
+        return false;
+
+    if (isa<GlobalVariable>(U))
+        return true;
+
+    for (auto &&User : U->users())
+    {
+        if (isGVFunc(User))
+        {
+            rc = true;
+            break;
+        }
+    }
+    return rc;
+}
+
+static bool
+isInstFunc(User *U)
+{
+    bool rc = false;
+    if (nullptr == U || isa<GlobalVariable>(U) || isa<CallBase>(U))
+        return false;
+
+    if (isa<StoreInst>(U) || isa<SelectInst>(U) || isa<PHINode>(U))
+        return true;
+
+    for (auto &&User : U->users())
+    {
+        if (isInstFunc(User))
+        {
+            rc = true;
+            break;
+        }
+    }
+    return rc;
+}
+
+static void
+addMapping(std::map<Type *, std::vector<StructIdx>> &Map, Type *Key, StructIdx ValueElem)
+{
+    if (Map.find(Key) == Map.end())
+    {
+        std::vector<StructIdx> Value;
+        Value.push_back(ValueElem);
+        auto Pair = std::pair<Type *, std::vector<StructIdx>>(Key, Value);
+        Map.insert(Pair);
+    }
+    else
+    {
+        auto Pair = Map.find(Key);
+        (*Pair).second.push_back(ValueElem);
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -518,43 +436,67 @@ llvmGetPassPluginInfo()
 
 // Helper functions
 #if DEBUG
-static void
-printPath(raw_ostream &OutS, const llvm::DenseMap<std::pair<Value *, Value *>, std::vector<Value *>> Paths)
+static void printFP2StructMapping()
 {
-    for (auto &Elem : Paths)
+    for (auto &&Map : FP2S)
     {
-        OutS << "===============The Begin Users================";
-        OutS << "\n";
-        OutS << Elem.first.first->getName();
-        OutS << "\n";
-        Elem.first.second->print(OutS);
-        OutS << "\n";
-        OutS << "=====================PATH=======================";
-        OutS << "\n";
+        LOG_STR("======== FuncPtrTy ========");
+        LOG(Map.first);
+        LOG_STR("======== StructTy ========");
+        for (auto &&StructIdx : Map.second)
+        {
+            LOG(StructIdx.first);
+            LOG_STR(StructIdx.second);
+        }
+        LOG_STR("");
+    }
+}
+
+static void printS2SMapping()
+{
+    for (auto &&Map : S2S)
+    {
+        LOG_STR("======== StructTy ========");
+        LOG(Map.first);
+        LOG_STR("======== StructTy ========");
+        for (auto &&StructIdx : Map.second)
+        {
+            LOG(StructIdx.first);
+            LOG_STR(StructIdx.second);
+        }
+        LOG_STR("");
+    }
+}
+
+static void printFuncs()
+{
+    LOG_STR("========== InstFuncs =========");
+    for (auto &&Func : InstFuncs)
+        LOG_STR(Func->getName());
+    LOG_STR("========== GVFuncs =========");
+    for (auto &&Func : GVFuncs)
+        LOG_STR(Func->getName());
+}
+
+static void printPaths(std::map<std::pair<Value *, Value *>, std::vector<Value *>> Paths)
+{
+    for (auto &&Elem : Paths)
+    {
+        LOG_STR("=========== USER ===========");
+        LOG_STR(Elem.first.first->getName());
+        LOG(Elem.first.second);
+        LOG_STR("=========== PATH ===========");
         for (auto &Val : Elem.second)
         {
             if (Val->getName().empty())
             {
-                Val->print(OutS);
-                OutS << "\n";
+                LOG(Val);
             }
-            else 
+            else
             {
-                OutS << Val->getName();
-                OutS << "\n";
+                LOG_STR(Val->getName());
             }
         }
-        OutS << "\n";
-        OutS << "\n";
-    }
-}
-
-static void
-printContainedFuncs(raw_ostream &OutS, const std::unordered_set<Function *> ContainedFPtrs)
-{
-    for (auto &&ContainedFPtr : ContainedFPtrs)
-    {
-        LOG_STR(ContainedFPtr->getName());
     }
 }
 #endif

@@ -1,5 +1,5 @@
-#ifndef FLTA_H
-#define FLTA_H
+#ifndef __FLTA_H__
+#define __FLTA_H__
 
 #include "llvm/ADT/MapVector.h"
 #include "llvm/IR/AbstractCallSite.h"

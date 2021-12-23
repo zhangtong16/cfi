@@ -9,14 +9,6 @@
 
 using namespace llvm;
 
-#define LOG(X)                            \
-	X->print(llvm::errs());               \
-	llvm::errs() << "\n";                 \
-	X->getDebugLoc().print(llvm::errs()); \
-	llvm::errs() << "\n"
-
-#define DEBUG 0
-
 #if (DEBUG)
 static void
 printFLTAResult(raw_ostream &OutS, const SmallVector<FunctionType *> &Vals);

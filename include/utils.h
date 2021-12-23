@@ -1,10 +1,20 @@
-#ifndef __UTILS_H
-#define __UTILS_H
+#ifndef __UTILS_H__
+#define __UTILS_H__
 
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/Transforms/Utils/FunctionComparator.h>
 
-#define MY_LOG(X) llvm::errs() << X << "\n";
+#define DEBUG 1
+
+#ifdef DEBUG
+#define LOG(x)              \
+    x->print(llvm::errs()); \
+    llvm::errs() << "\n"
+#define LOG_STR(x) llvm::errs() << x << "\n"
+#else
+#define LOG(x)
+#define LOG_STR(x)
+#endif
 
 static std::unordered_set<const llvm::Type *> VisitedTypes;
 
@@ -20,6 +30,18 @@ static inline bool isEmptyStructPtr(const llvm::PointerType *PtrTy)
         }
     }
     return false;
+}
+
+static bool isI8PtrTy(llvm::Type *Ty)
+{
+	bool isI8Ptr = false;
+	if (Ty->isPointerTy())
+		if (auto PtrElemTy = llvm::dyn_cast<llvm::IntegerType>(Ty->getPointerElementType()))
+		{
+			if (PtrElemTy->getBitWidth() == 8)
+				isI8Ptr = true;
+		}
+	return isI8Ptr;
 }
 
 static bool __isIdenticalType(const llvm::Type *left, const llvm::Type *right)
@@ -52,6 +74,18 @@ static bool __isIdenticalType(const llvm::Type *left, const llvm::Type *right)
         auto left_ptr = llvm::cast<llvm::PointerType>(left);
         auto right_ptr = llvm::cast<llvm::PointerType>(right);
         assert(left_ptr && right_ptr && "Both types must be pointers here.");
+
+        // if both of them are opaque
+        if (left_ptr->isOpaquePointerTy() && right_ptr->isOpaquePointerTy())
+        {
+            return true;
+        }
+        // if one of them is opaque
+        else if (left_ptr->isOpaquePointerTy() || right_ptr->isOpaquePointerTy())
+        {
+            return false;
+        }
+        // neither
 
         // { }* cannot be compared with
         // https://lists.llvm.org/pipermail/cfe-dev/2016-November/051513.html
@@ -174,5 +208,21 @@ bool isFuncPtrTy(const llvm::Type *Ty)
     }
 
     return false;
+}
+
+static llvm::Type *extractTy(llvm::Type *Ty)
+{
+    if (Ty->isArrayTy())
+    {
+        return extractTy(Ty->getArrayElementType());
+    }
+    else if (Ty->isPointerTy())
+    {
+        return extractTy(Ty->getPointerElementType());
+    }
+    else
+    {
+        return Ty;
+    }
 }
 #endif // __UTILS_H

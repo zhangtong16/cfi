@@ -9,44 +9,34 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/Type.h"
 
-struct MLTAType
+#include "utils.h"
+
+using LayeredType = std::pair<llvm::Type *, std::vector<llvm::Value *>>;
+using MultiLayeredType = std::vector<LayeredType>;
+
+bool isIdenticalLayeredType(LayeredType &Left, LayeredType &Right)
 {
-	static bool isIdentical(MLTAType *Ty){return true;};
-	
-	MLTAType(llvm::Value *Elem)
+	bool isIdentical = true;
+
+	// if ty1 == ty2, and indices.size() == indices.size()
+	if (isIdenticalType(Left.first, Right.first) && Left.second.size() == Right.second.size())
 	{
-		this->Elem = Elem;
+		for (unsigned int i = 0; i < Left.second.size(); i++)
+		{
+			// FIXME: llvm::Constant is static?
+			if (Left.second.at(i) != Right.second.at(i))
+			{
+				isIdentical = false;
+			}
+		}
+	}
+	else
+	{
+		isIdentical = false;
 	}
 
-	~MLTAType()
-	{
-		this->Elem = nullptr;
-		this->LayeredType.clear();
-	}
-
-	void addType(llvm::Type *Ty)
-	{
-		this->LayeredType.push_back(Ty);
-	}
-
-	std::vector<llvm::Type *>
-	getType()
-	{
-		return this->LayeredType;
-	}
-
-private:
-	std::vector<llvm::Type *> LayeredType;
-	llvm::Value * Elem;
-};
-
-struct FuncTy : public MLTAType
-{
-};
-
-struct ICallTy : public MLTAType
-{
-};
+	return isIdentical;
+}
 
 struct MLTA : public llvm::AnalysisInfoMixin<MLTA>
 {
