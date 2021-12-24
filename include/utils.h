@@ -225,4 +225,20 @@ static llvm::Type *extractTy(llvm::Type *Ty)
         return Ty;
     }
 }
+
+static llvm::Type *extractArrayTy(llvm::Type *Ty)
+{
+    if (Ty->isArrayTy())
+    {
+        return extractArrayTy(Ty->getArrayElementType());
+    }
+    else if (Ty->isPointerTy() && Ty->getPointerElementType()->isArrayTy())
+    {
+        return extractArrayTy(Ty->getPointerElementType());
+    }
+    else
+    {
+        return Ty;
+    }
+}
 #endif // __UTILS_H

@@ -17,8 +17,9 @@ static std::unordered_set<llvm::Function *> InstFuncs;
 
 ///////////////////////////////////////////////////////////////////
 //// (func, use) -> [path]
-static std::map<std::pair<Value *, Value *>, std::vector<Value *>> InstPaths;
-static std::map<std::pair<Value *, Value *>, std::vector<Value *>> GVPaths;
+using PathsTy = std::map<std::pair<Value *, Value *>, std::vector<Value *>>;
+static PathsTy InstPaths;
+static PathsTy GVPaths;
 //// helper data structures
 static std::vector<Value *> Path;
 static std::unordered_set<PHINode *> VisitedPHINodes;
@@ -34,18 +35,28 @@ static FuncStructMap FP2S;
 using Struct2StructMap = std::map<Type *, std::vector<StructIdx>>;
 static Struct2StructMap S2S;
 
+//////////////////////////////////////////////////////////////////
+//// For Multi-Layered Type
+//// There is no field sensitivity currently
+using MLT = std::vector<Type *>;
+using MLT2Func = std::map<std::vector<Type *>, std::unordered_set<Value *>>;
+using MLT2FuncElem = std::pair<MLT, std::unordered_set<Value *>>;
+static MLT2Func MLT2FuncMap;
+
 #ifdef DEBUG
 static void printFP2StructMapping();
 static void printS2SMapping();
 static void printFuncs();
 static void printPaths(std::map<std::pair<Value *, Value *>, std::vector<Value *>> Paths);
+static void printMLTMapping();
 #endif
 
 static bool isGVFunc(User *U);
 static bool isInstFunc(User *U);
 static void getInstPath(Value *Val);
 static void getGVPath(Value *Val);
-static void addMapping(std::map<Type *, std::vector<StructIdx>> &Map, Type *Key, StructIdx ValueElem);
+static void addStructMapping(std::map<Type *, std::vector<StructIdx>> &Map, Type *Key, StructIdx ValueElem);
+static void addMLT2FuncMapping(MLT2Func &Map, MLT &Key, Value *ValueElem);
 
 static void
 analysis(Module &M)
@@ -123,7 +134,7 @@ getGVFuncPath()
 }
 
 static void
-makeMapping(Module &M)
+makeStructMapping(Module &M)
 {
     for (auto &&StructTy : M.getIdentifiedStructTypes())
     {
@@ -138,12 +149,12 @@ makeMapping(Module &M)
             if (ElemType->isStructTy())
             {
                 if ((ElemType->getNumContainedTypes() != 0))
-                    addMapping(S2S, ElemType, StructIdx(StructTy, i));
+                    addStructMapping(S2S, ElemType, StructIdx(StructTy, i));
                 continue;
             }
             if (isFuncPtrTy(ElemType))
             {
-                addMapping(FP2S, ElemType, StructIdx(StructTy, i));
+                addStructMapping(FP2S, ElemType, StructIdx(StructTy, i));
                 continue;
             }
 
@@ -154,21 +165,97 @@ makeMapping(Module &M)
     }
 }
 
+static void
+makeMLT2InstFuncMapping()
+{
+    MLT MLTy;
+    for (auto &&Path : InstPaths)
+    {
+        auto Func = Path.first.first;
+        MLTy.clear();
+        for (auto &&Val : Path.second)
+        {
+            if (auto GEPI = dyn_cast<GetElementPtrInst>(Val))
+            {
+                auto Ty = GEPI->getPointerOperandType();
+
+                if (std::find(MLTy.begin(), MLTy.end(), Ty) == MLTy.end())
+                    MLTy.push_back(Ty);
+
+                if (isI8PtrTy(Ty))
+                    break;
+                continue;
+            }
+
+            if (auto SI = dyn_cast<StoreInst>(Val))
+            {
+                auto Ty = SI->getValueOperand()->stripPointerCasts()->getType();
+                if (std::find(MLTy.begin(), MLTy.end(), Ty) == MLTy.end())
+                    MLTy.push_back(Ty);
+                continue;
+            }
+
+            if (auto GEPOp = dyn_cast<GEPOperator>(Val))
+            {
+                auto Ty = GEPOp->getPointerOperandType();
+
+                if (std::find(MLTy.begin(), MLTy.end(), Ty) == MLTy.end())
+                    MLTy.push_back(Ty);
+
+                if (isI8PtrTy(Ty))
+                    break;
+                continue;
+            }
+        }
+        addMLT2FuncMapping(MLT2FuncMap, MLTy, Func);
+    }
+}
+
+static void
+makeMLT2GVFuncMapping()
+{
+    MLT MLTy;
+    
+    for (auto &&Path : GVPaths)
+    {
+        auto Func = Path.first.first;
+        MLTy.clear();
+        MLTy.push_back(Func->getType());
+        for (auto &&Val : Path.second)
+        {
+            if (auto GV = dyn_cast<GlobalValue>(Val))
+            {
+                auto Ty = extractArrayTy(GV->getType());
+                auto Lambda = [&Ty](const auto &Elem){return isIdenticalType(Ty, Elem);};
+                if (std::find_if(MLTy.begin(), MLTy.end(), Lambda) == MLTy.end())
+                    MLTy.push_back(Ty);
+            }
+        }
+        addMLT2FuncMapping(MLT2FuncMap, MLTy, Func);
+    }
+}
+
+// TODO: Verify Inst and GV Path
+
+
 void MLTA::runOnModule(Module &M)
 {
-    makeMapping(M);
+    makeStructMapping(M);
     analysis(M);
     divideFunc();
     getInstFuncPath();
     getGVFuncPath();
+    makeMLT2InstFuncMapping();
+    makeMLT2GVFuncMapping();
 }
 
 PreservedAnalyses
 MLTA::run(llvm::Module &M, llvm::ModuleAnalysisManager &)
 {
     runOnModule(M);
-    // printFuncs();
+    printFuncs();
     printPaths(GVPaths);
+    printMLTMapping();
     return PreservedAnalyses::none();
 }
 
@@ -315,7 +402,8 @@ getGVPath(Value *Val)
         if (VisitedConstants.find(Val) != VisitedConstants.end())
             return;
         VisitedConstants.insert(Val);
-        Path.push_back(Val);
+        if (isa<GlobalValue>(Val))
+            Path.push_back(Val);
 
         for (auto &&U : Val->users())
         {
@@ -328,11 +416,9 @@ getGVPath(Value *Val)
     // BitCast, GEP, Ptr2int, ...
     if (isa<Operator>(Val))
     {
-        LOG_STR("Operator");
         for (auto &&U : Val->users())
             if (!isa<Instruction>(U))
             {
-                Path.push_back(Val);
                 getGVPath(Val);
             }
         return;
@@ -387,7 +473,7 @@ isInstFunc(User *U)
 }
 
 static void
-addMapping(std::map<Type *, std::vector<StructIdx>> &Map, Type *Key, StructIdx ValueElem)
+addStructMapping(std::map<Type *, std::vector<StructIdx>> &Map, Type *Key, StructIdx ValueElem)
 {
     if (Map.find(Key) == Map.end())
     {
@@ -400,6 +486,22 @@ addMapping(std::map<Type *, std::vector<StructIdx>> &Map, Type *Key, StructIdx V
     {
         auto Pair = Map.find(Key);
         (*Pair).second.push_back(ValueElem);
+    }
+}
+
+static void addMLT2FuncMapping(MLT2Func &Map, MLT &Key, Value *ValueElem)
+{
+    if (Map.find(Key) == Map.end())
+    {
+        std::unordered_set<Value *> Value;
+        Value.insert(ValueElem);
+        auto Pair = MLT2FuncElem(Key, Value);
+        Map.insert(Pair);
+    }
+    else
+    {
+        auto Pair = Map.find(Key);
+        (*Pair).second.insert(ValueElem);
     }
 }
 
@@ -497,6 +599,23 @@ static void printPaths(std::map<std::pair<Value *, Value *>, std::vector<Value *
                 LOG_STR(Val->getName());
             }
         }
+        LOG_STR("");
+    }
+}
+
+static void printMLTMapping()
+{
+    for (auto &&Elem : MLT2FuncMap)
+    {
+        for (auto &&Ty : Elem.first)
+        {
+            LOG(Ty);
+        }
+        for (auto &&Func : Elem.second)
+        {
+            LOG_STR(Func->getName());
+        }
+        LOG_STR("");
     }
 }
 #endif
