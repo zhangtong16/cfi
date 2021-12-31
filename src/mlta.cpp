@@ -142,10 +142,6 @@ makeStructMapping(Module &M)
         {
             auto ElemType = extractTy(StructTy->getElementType(i));
 
-            if (ElemType->isIntegerTy())
-            {
-                continue;
-            }
             if (ElemType->isStructTy())
             {
                 if ((ElemType->getNumContainedTypes() != 0))
@@ -157,10 +153,8 @@ makeStructMapping(Module &M)
                 addStructMapping(FP2S, ElemType, StructIdx(StructTy, i));
                 continue;
             }
-
-            LOG(ElemType);
-            LOG(StructTy);
-            llvm_unreachable("Unknown Type!!!");
+            // We consider Struct related type only
+            continue;
         }
     }
 }
@@ -215,7 +209,7 @@ static void
 makeMLT2GVFuncMapping()
 {
     MLT MLTy;
-    
+
     for (auto &&Path : GVPaths)
     {
         auto Func = Path.first.first;
@@ -226,7 +220,8 @@ makeMLT2GVFuncMapping()
             if (auto GV = dyn_cast<GlobalValue>(Val))
             {
                 auto Ty = extractArrayTy(GV->getType());
-                auto Lambda = [&Ty](const auto &Elem){return isIdenticalType(Ty, Elem);};
+                auto Lambda = [&Ty](const auto &Elem)
+                { return isIdenticalType(Ty, Elem); };
                 if (std::find_if(MLTy.begin(), MLTy.end(), Lambda) == MLTy.end())
                     MLTy.push_back(Ty);
             }
@@ -236,7 +231,9 @@ makeMLT2GVFuncMapping()
 }
 
 // TODO: Verify Inst and GV Path
-
+static void verifyPath()
+{
+}
 
 void MLTA::runOnModule(Module &M)
 {
@@ -253,9 +250,9 @@ PreservedAnalyses
 MLTA::run(llvm::Module &M, llvm::ModuleAnalysisManager &)
 {
     runOnModule(M);
-    printFuncs();
-    printPaths(GVPaths);
-    printMLTMapping();
+    // printFuncs();
+    printPaths(InstPaths);
+    // printMLTMapping();
     return PreservedAnalyses::none();
 }
 
@@ -268,7 +265,7 @@ getInstPath(Value *Val)
     if (isa<Instruction>(Val))
     {
         // sink
-        if (isa<CallBase>(Val) || isa<ICmpInst>(Val) || isa<AllocaInst>(Val) || isa<BinaryOperator>(Val) || isa<ReturnInst>(Val) || isa<IntToPtrInst>(Val) || isa<AllocaInst>(Val))
+        if (isa<CallBase>(Val) || isa<ICmpInst>(Val) || isa<AllocaInst>(Val) || isa<BinaryOperator>(Val) || isa<ReturnInst>(Val) || isa<IntToPtrInst>(Val) || isa<AllocaInst>(Val) || isa<PtrToIntInst>(Val))
         {
             Path.push_back(Val);
             return;
@@ -314,8 +311,16 @@ getInstPath(Value *Val)
         }
         if (auto SI = dyn_cast<SelectInst>(Val))
         {
-            Path.push_back(SI);
+            bool TrackUser = false;
+
             if (isFuncPtrTy(SI->getTrueValue()->stripPointerCasts()->getType()) || isFuncPtrTy(SI->getFalseValue()->stripPointerCasts()->getType()))
+                TrackUser = true;
+            // ugly corner case
+            if (!Path.empty() && isa<StoreInst>(Path.back()))
+                TrackUser = false;
+
+            Path.push_back(SI);
+            if (TrackUser)
             {
                 for (auto &&U : SI->users())
                     getInstPath(U);
@@ -378,8 +383,8 @@ getInstPath(Value *Val)
         if (auto P2IOp = dyn_cast<PtrToIntOperator>(Val))
         {
             Path.push_back(P2IOp);
-            for (auto &&U : P2IOp->users())
-                getInstPath(U);
+            // for (auto &&U : P2IOp->users())
+            //     getInstPath(U);
             return;
         }
     }
@@ -399,6 +404,12 @@ getGVPath(Value *Val)
 {
     if (isa<Constant>(Val))
     {
+        if (auto CE = dyn_cast<ConstantExpr>(Val))
+        {
+            if (CE->isCast() && isI8PtrTy(CE->getType()))
+                return;
+        }
+
         if (VisitedConstants.find(Val) != VisitedConstants.end())
             return;
         VisitedConstants.insert(Val);

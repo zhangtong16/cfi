@@ -232,7 +232,17 @@ static llvm::Type *extractArrayTy(llvm::Type *Ty)
     {
         return extractArrayTy(Ty->getArrayElementType());
     }
+    else if (Ty->isVectorTy())
+    {
+        LOG(Ty);
+        auto VecTy = llvm::dyn_cast<llvm::VectorType>(Ty);
+        return extractArrayTy(VecTy->getElementType());
+    }
     else if (Ty->isPointerTy() && Ty->getPointerElementType()->isArrayTy())
+    {
+        return extractArrayTy(Ty->getPointerElementType());
+    }
+    else if (Ty->isPointerTy() && Ty->getPointerElementType()->isVectorTy())
     {
         return extractArrayTy(Ty->getPointerElementType());
     }
